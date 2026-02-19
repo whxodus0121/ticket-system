@@ -33,15 +33,44 @@
   - 원인 분석: Redis의 인메모리 처리 속도와 MySQL의 디스크 I/O 처리 속도 차이로 인한 동기식 저장의 병목 현상 발생
 - **결과**: 예매와 취소의 전체 사이클은 완성되었으나, 고부하 환경에서의 안정적인 쓰기 성능을 위해 비동기 메시지 큐(Kafka) 도입의 필요성을 기술적으로 도출
 
+🟣 v4.5: Kafka 비동기 처리 완성 및 분산 환경 멱등성 보장
+- **주요 내용**: Kafka 도입을 통한 쓰기 지연(Write-Behind) 패턴 구현 및 메시지 중복 처리 최적화
+- **해결 방법**: 
+  - 비동기 저장 파이프라인: API 서버는 Kafka Producer로서 메시지를 발행하고 즉시 응답하며, 별도의 Consumer 워커가 MySQL 저장을 전담하여 Slow SQL 병목 해결
+  - 멱등성(Idempotency) 설계: Kafka의 재전송 정책으로 인한 중복 데이터 유입 시에도 DB 무결성을 유지하도록 UNIQUE KEY 기반의 방어막 구축
+  - DB 최적화 (GORM Clauses): OnConflict(DoNothing) 전략을 사용하여 중복 데이터 발생 시 불필요한 에러 로그 대신 '우아한 스킵(Graceful Skip)' 처리
+  - 인터페이스 고도화: 리포지토리 함수 리턴 타입을 (bool, error)로 개선하여 실제 저장 성공 여부를 워커가 명확히 인지하도록 구현
+- **결과**: 고부하 상황에서도 Redis의 처리 속도와 DB 저장 속도 간의 간극을 Kafka 버퍼로 완벽히 해소하고, 데이터 정합성 100% 달성
+
 ---
 ## 🛠 Tech Stack
 - **Language**: Go (Golang)
 - **Database**: MySQL 8.0 (GORM)
 - **Cache & Lock**: Redis
+- **Message Broker**: Apache Kafka & Zookeeper
 - **Container**: Docker, WSL2
 - **Test**: Stress Testing with Goroutines
 
 ## 🚦 실행 방법 (How to Run)
-1. **Docker 컨테이너 실행**
+1. **인프라 컨테이너 실행**
+   Docker를 통해 필수 미들웨어(MySQL, Redis, Kafka, Zookeeper)를 한꺼번에 실행합니다.
    ```bash
-   docker start my-mysql my-redis
+   docker start ticket-mysql ticket-redis ticket-kafka ticket-zookeeper
+   
+2. **MySQL 테이블 생성 및 제약 조건 설정**
+
+   중복 예매 방지(멱등성)를 위해 UNIQUE KEY가 포함된 테이블을 생성합니다.
+   CREATE TABLE purchases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL,
+    ticket_name VARCHAR(255) NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_user_ticket (user_id, ticket_name)
+  );
+   
+3. **Kafka Consumer 워커 실행**
+   Kafka 이벤트를 감시하며 DB에 저장하는 워커를 실행합니다. (다중 터미널 실행 권장)
+   go run cmd/worker/main.go
+4. **API 서버 및 동시성 테스트 실행**
+   실제 예매 요청을 생성하여 시스템을 테스트합니다.
+   go run main.go
