@@ -60,17 +60,20 @@
 2. **MySQL 테이블 생성 및 제약 조건 설정**
 
    중복 예매 방지(멱등성)를 위해 UNIQUE KEY가 포함된 테이블을 생성합니다.
+   ```bash
    CREATE TABLE purchases (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     user_id VARCHAR(255) NOT NULL,
     ticket_name VARCHAR(255) NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_user_ticket (user_id, ticket_name)
-  );
+   );
    
-3. **Kafka Consumer 워커 실행**
+4. **Kafka Consumer 워커 실행**
    Kafka 이벤트를 감시하며 DB에 저장하는 워커를 실행합니다. (다중 터미널 실행 권장)
+   ```bash
    go run cmd/worker/main.go
-4. **API 서버 및 동시성 테스트 실행**
+5. **API 서버 및 동시성 테스트 실행**
    실제 예매 요청을 생성하여 시스템을 테스트합니다.
+   ```bash
    go run main.go
