@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 )
 
 func main() {
 	var wg sync.WaitGroup
-	totalUsers := 1000 // 동시에 시도할 가상 사용자 수
+	totalUsers := 50000 // 동시에 시도할 가상 사용자 수
 
 	for i := 0; i < totalUsers; i++ {
 		wg.Add(1)
@@ -53,7 +54,8 @@ func main() {
 
 				case http.StatusConflict: // 409 Conflict (락 획득 실패)
 					resp.Body.Close()
-					// 재시도 루프를 계속 돕니다.
+					time.Sleep(10 * time.Millisecond) // 아주 잠깐 쉬었다가 재시도 (선택 사항)
+					continue
 
 				default:
 					fmt.Printf("사용자 %d: 기타 응답 (%d) (ID: %s)\n", user, resp.StatusCode, userID)

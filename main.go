@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"ticket-system/handler"
+	"ticket-system/metrics"
 	"ticket-system/repository"
 	"ticket-system/service"
 	"ticket-system/worker" // [추가] 워커 패키지
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -18,8 +21,17 @@ import (
 func main() {
 	// 1. Redis 연결 설정 (docker-compose의 ticket-redis 사용)
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: "localhost:16379",
 	})
+
+	ctx := context.Background()
+	stockKey := "ticket_stock:concert_2026"
+
+	// 값이 없을 때만 1000으로 초기화
+	rdb.Set(ctx, stockKey, 1000, 0)
+	rdb.Del(ctx, "purchased_users:concert_2026")
+
+	metrics.TicketStockLevel.Set(1000)
 
 	// 2. MySQL 연결 설정 (docker-compose의 ticket-mysql 사용)
 	// 비밀번호와 DB명은 docker-compose.yml 설정과 동일하게 유지
@@ -55,8 +67,31 @@ func main() {
 		"ticket-topic",
 		"purchase-group",
 		mysqlRepo,
+		kafkaRepo,
 	)
 	go purchaseWorker.Start() // 고루틴으로 실행
+
+	go func() {
+		for {
+			time.Sleep(500 * time.Millisecond) // 1초마다 Redis 실제 값 확인
+			val, err := rdb.Get(context.Background(), stockKey).Int()
+			if err == nil {
+				// Redis의 진짜 값이 0보다 작으면(동시성 이슈 등) 0으로, 아니면 실제 값 그대로 세팅
+				if val < 0 {
+					metrics.TicketStockLevel.Set(0)
+				} else {
+					metrics.TicketStockLevel.Set(float64(val))
+				}
+			}
+		}
+	}()
+
+	go func() {
+		log.Println("📊 Prometheus metrics server started on :8081")
+		if err := http.ListenAndServe(":8081", promhttp.Handler()); err != nil {
+			log.Printf("메트릭 서버 실행 실패: %v", err)
+		}
+	}()
 
 	// 6. Handler 조립
 	h := handler.NewTicketHandler(svc)
@@ -83,6 +118,11 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"message": "%s"}`, message)
+	})
+
+	mux.HandleFunc("/admin/recover-dlq", func(w http.ResponseWriter, r *http.Request) {
+		go purchaseWorker.ProcessDLQ() // 별도 고루틴으로 실행
+		fmt.Fprint(w, `{"message": "DLQ 복구 프로세스가 시작되었습니다."}`)
 	})
 
 	// 8. 서버 실행 설정
