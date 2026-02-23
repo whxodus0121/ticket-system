@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 2s # 2초마다 빠르게 수집 (테스트용)
+
+scrape_configs:
+  - job_name: 'go-ticket-app'
+    static_configs:
+      - targets: ['172.22.126.0:8081'] # WSL2/Windows에서 내 Go 서버 접속 주소

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"ticket-system/metrics"
 	"ticket-system/repository"
 )
 
@@ -24,10 +25,13 @@ func (s *TicketService) BuyTicket(userID string) (bool, int) {
 	ctx := context.Background()
 	ticketName := "concert_2026"
 
-	// 1. [중요] 중복 구매 확인 (이미 샀는지 Redis 명단 확인)
+	//예매 요청이 들어올 때마다 Counter 증가
+	metrics.PurchaseRequests.Inc()
+
+	// 1. 중복 구매 확인 (이미 샀는지 Redis 명단 확인)
 	isPurchased, err := s.LockRepo.IsUserPurchased(ctx, ticketName, userID)
 	if err != nil || isPurchased {
-		// 이미 구매했다면 여기서 컷!
+
 		return false, 0
 	}
 
@@ -37,21 +41,24 @@ func (s *TicketService) BuyTicket(userID string) (bool, int) {
 		return false, 0
 	}
 
-	// 3. [중요] Redis 구매자 명단에 추가 (이게 있어야 나중에 취소 가능)
+	metrics.TicketStockLevel.Set(float64(remaining))
+
+	// 3. Redis 구매자 명단에 추가
 	err = s.LockRepo.AddPurchasedUser(ctx, ticketName, userID)
 	if err != nil {
-		fmt.Printf("Redis 명단 추가 실패: %v\n", err)
-		// 명단 추가 실패 시 깎았던 재고 다시 복구 (정합성)
-		s.LockRepo.IncreaseStock(ctx, ticketName)
+		// 실패 시 롤백
+		newStock, _ := s.LockRepo.IncreaseStock(ctx, ticketName)
+		metrics.TicketStockLevel.Set(float64(newStock)) // 롤백된 재고 반영
 		return false, 0
 	}
 
-	// 4. Kafka에 "예매 성공 이벤트" 발행
+	// 4. Kafka에 예매 성공 이벤트 발행
 	err = s.KafkaRepo.PublishPurchase(userID, ticketName)
 	if err != nil {
 		fmt.Printf("Kafka 메시지 전송 실패: %v\n", err)
 		// Kafka 전송 실패 시 롤백 (재고 복구 및 명단 삭제)
-		s.LockRepo.IncreaseStock(ctx, ticketName)
+		newStock, _ := s.LockRepo.IncreaseStock(ctx, ticketName)
+		metrics.TicketStockLevel.Set(float64(newStock))
 		s.LockRepo.RemovePurchasedUser(ctx, ticketName, userID)
 		return false, remaining
 	}
@@ -70,11 +77,13 @@ func (s *TicketService) CancelTicket(userID string) (bool, string) {
 	}
 
 	// 2. Redis 재고 복구 (+1)
-	_, err = s.LockRepo.IncreaseStock(ctx, ticketName)
+	newStock, err := s.LockRepo.IncreaseStock(ctx, ticketName)
 	if err != nil {
 		fmt.Printf("[오류] 재고 복구 실패: %v\n", err)
 		return false, "재고 복구 중 오류가 발생했습니다."
 	}
+
+	metrics.TicketStockLevel.Set(float64(newStock))
 
 	// 3. Redis 구매자 명단에서 삭제 (이래야 나중에 다시 살 수 있음)
 	err = s.LockRepo.RemovePurchasedUser(ctx, ticketName, userID)
