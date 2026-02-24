@@ -81,6 +81,13 @@ graph TD
   - 비동기 취소 프로세스 (Delete-Behind): 취소 요청 시 Redis 재고를 즉시 복구하고 명단에서 제거하여 유저에게 **가용성(Availability)**을 즉시 반환
                                         실제 DB 데이터 삭제는 Kafka를 통해 비동기로 처리하여 예매와 동일한 고성능 쓰기 아키텍처 완성
   - 장애 복구 파이프라인(DLQ) 도입: 워커가 DB 저장 실패 시 3회 재시도를 수행하고, 최종 실패 시 ticket-dlq-topic으로 메시지를 격리하여 데이터 유실 0% 달성
+ 
+    서버 실행 후 mysql을 종료하여 데이터들이 DLQ에 저장
+    ![DLQ_1](./images/DLQ_1.jpg)
+
+    mysql을 재시동하여 DLQ에 저장된 데이터들이 mysql로 이동
+    ![DLQ_2](./images/DLQ_2.jpg)
+    
 - **결과**: 재고 정확도 확보: 무한 루프 예매/취소 테스트 시에도 재고가 항상 0 ~ MAX사이를 유지
 
 ### ⚪ v6.0: Observability 구축 및 시스템 신뢰성 검증
@@ -123,7 +130,6 @@ graph TD
    
 2. **MySQL 테이블 생성 및 제약 조건 설정**
 
-   중복 예매 방지(멱등성)를 위해 UNIQUE KEY가 포함된 테이블을 생성합니다.
    ```bash
    CREATE TABLE purchases (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -132,6 +138,17 @@ graph TD
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_user_ticket (user_id, ticket_name)
    );
+   ```
+   ```bash
+   CREATE TABLE tickets (
+      id bigint unsigned NOT NULL AUTO_INCREMENT,
+      name varchar(255) UNIQUE, -- 공연 이름 (예: concert_2026)
+      stock int DEFAULT 0,      -- 남은 재고
+      price int DEFAULT 0,
+      created_at datetime(3) NULL,
+      updated_at datetime(3) NULL,
+      PRIMARY KEY (`id`)
+    );
    
 4. **Kafka Consumer 워커 실행**
    Kafka 이벤트를 감시하며 DB에 저장하는 워커를 실행합니다. (다중 터미널 실행 권장)
