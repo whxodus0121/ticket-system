@@ -85,7 +85,7 @@ graph TD
     서버 실행 후 mysql을 종료하여 데이터들이 DLQ에 저장
     ![DLQ_1](./images/DLQ_1.jpg)
 
-    mysql을 재시동하여 DLQ에 저장된 데이터들이 mysql로 이동
+    mysql을 재시동하여 DLQ에 저장된 데이터들이 mysql로 이동(DLQ에 저장된 user번호가 mysql로 다시 처리됨)
     ![DLQ_2](./images/DLQ_2.jpg)
     
 - **결과**: 재고 정확도 확보: 무한 루프 예매/취소 테스트 시에도 재고가 항상 0 ~ MAX사이를 유지
