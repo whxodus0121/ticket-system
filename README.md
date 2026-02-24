@@ -81,9 +81,9 @@
 
 ## 🚦 실행 방법 (How to Run)
 1. **인프라 컨테이너 실행**
-   Docker를 통해 필수 미들웨어(MySQL, Redis, Kafka, Zookeeper)를 한꺼번에 실행합니다.
+   Docker Compose를 사용하여 모든 미들웨어(MySQL, Redis, Kafka, Zookeeper)를 한꺼번에 실행합니다.
    ```bash
-   docker start ticket-mysql ticket-redis ticket-kafka ticket-zookeeper
+   docker-compose up -d
    
 2. **MySQL 테이블 생성 및 제약 조건 설정**
 
@@ -105,3 +105,22 @@
    실제 예매 요청을 생성하여 시스템을 테스트합니다.
    ```bash
    go run main.go
+
+
+sequenceDiagram
+    participant User
+    participant API as Go API Server
+    participant Redis as Redis (Queue/Stock)
+    participant Kafka
+    participant Worker as DB Worker
+    participant MySQL
+
+    User->>API: 예매 요청 (user_id)
+    API->>Redis: 대기열 진입 및 순번 확인
+    Note over API, Redis: Lua Script (Atomic Stock)
+    API-->>User: 202 Accepted (대기 순번 반환)
+    
+    API->>Kafka: 예매 성공 이벤트 발행
+    Kafka->>Worker: 이벤트 컨슘
+    Worker->>MySQL: 구매 내역 저장 (Unique Key 보장)
+    Note right of MySQL: 멱등성 유지
