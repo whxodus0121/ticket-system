@@ -10,55 +10,50 @@ import (
 
 func main() {
 	var wg sync.WaitGroup
-	totalUsers := 50000 // 동시에 시도할 가상 사용자 수
+	totalUsers := 50000
 
 	for i := 0; i < totalUsers; i++ {
 		wg.Add(1)
 		go func(user int) {
 			defer wg.Done()
 
-			// 1. 사용자별 고유 ID를 먼저 만듭니다. (예: user_1, user_2...)
 			userID := fmt.Sprintf("user_%d", user)
-			// v3 중복 방지용 테스트
-			//userID := "test_user_99"
-			for {
-				// 2. [중요] URL 뒤에 ?user_id= 값을 붙여서 서버에 알려줍니다.
-				url := fmt.Sprintf("http://localhost:8080/ticket?user_id=%s", userID)
+			url := fmt.Sprintf("http://localhost:8080/ticket?user_id=%s", userID)
 
+			for {
 				resp, err := http.Get(url)
 				if err != nil {
-					fmt.Printf("사용자 %d: 연결 에러 - %v\n", user, err)
 					return
 				}
 
-				// StatusCode로 상태 확인
 				switch resp.StatusCode {
-				case http.StatusOK: // 200 OK
+				case http.StatusOK: // 200: 드디어 예매 성공!
 					fmt.Printf("사용자 %d: ★ 예매 성공! (ID: %s)\n", user, userID)
 					resp.Body.Close()
 					return
 
-				case http.StatusBadRequest: // 400 Bad Request (중복 구매 거절)
-					// 서버가 보낸 "티켓은 1인 1매입니다." 메시지를 읽어옵니다.
-					var result map[string]string
+				case http.StatusAccepted: // 202: 대기열 진입 성공 (순번 대기 중)
+					var result map[string]interface{}
 					json.NewDecoder(resp.Body).Decode(&result)
 
-					fmt.Printf("사용자 %d: [거절] %s (ID: %s)\n", user, result["error"], userID)
+					// 대기 번호를 출력하며 1초 대기 후 재시도(Polling)
+					fmt.Printf("사용자 %d: [대기중] 순번: %v (ID: %s)\n", user, result["rank"], userID)
 					resp.Body.Close()
-					return
 
-				case http.StatusGone: // 410 Gone (매진)
-					fmt.Printf("사용자 %d: [품절] 매진되었습니다. 시도를 중단합니다. (ID: %s)\n", user, userID)
-					resp.Body.Close()
-					return
-
-				case http.StatusConflict: // 409 Conflict (락 획득 실패)
-					resp.Body.Close()
-					time.Sleep(10 * time.Millisecond) // 아주 잠깐 쉬었다가 재시도 (선택 사항)
+					time.Sleep(1 * time.Second) // 1초 뒤에 "저 이제 차례인가요?" 물어봄
 					continue
 
+				case http.StatusGone: // 410: 매진
+					fmt.Printf("사용자 %d: [품절] 시도 중단 (ID: %s)\n", user, userID)
+					resp.Body.Close()
+					return
+
+				case http.StatusBadRequest: // 400: 이미 구매함
+					fmt.Printf("사용자 %d: [거절] 이미 구매한 사용자 (ID: %s)\n", user, userID)
+					resp.Body.Close()
+					return
+
 				default:
-					fmt.Printf("사용자 %d: 기타 응답 (%d) (ID: %s)\n", user, resp.StatusCode, userID)
 					resp.Body.Close()
 					return
 				}
@@ -67,7 +62,5 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Println("------------------------------------")
-	fmt.Println("모든 테스트가 종료되었습니다.")
-	fmt.Println("------------------------------------")
+	fmt.Println("테스트 종료")
 }

@@ -44,6 +44,11 @@ func NewPurchaseWorker(brokers []string, topic string, groupID string, tr reposi
 	}
 }
 
+/*
+ * Start: Kafka 이벤트를 소비하여 DB 작업을 수행하는 소비자 루프
+ * 예매 성공과 취소 이벤트를 분기하여 처리합니다.
+ */
+
 func (w *PurchaseWorker) Start() {
 	fmt.Println("🚀 Kafka Consumer Worker 시작... [예매 저장/취소 처리 대기 중]")
 
@@ -130,7 +135,7 @@ func (w *PurchaseWorker) handleCancel(userID string, ticketName string, rawMsg k
 	// 3번 모두 실패 시 DLQ로 전송
 	log.Printf("❌ [취소 최종 실패] 유저 %s의 취소 메시지 DLQ 이동. 사유: %v", userID, lastErr)
 
-	// DLQ 토픽으로 전송 (예매와 같은 토픽을 써도 되고, ticket-cancel-dlq-topic으로 나눠도 됩니다)
+	// DLQ 토픽으로 전송
 	err := w.KafkaRepo.PublishToTopic(context.Background(), "ticket-dlq-topic", rawMsg.Key, rawMsg.Value)
 	if err != nil {
 		log.Printf("💣 [치명적 에러] 취소 DLQ 전송 실패: %v", err)

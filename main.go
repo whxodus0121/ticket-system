@@ -9,7 +9,7 @@ import (
 	"ticket-system/metrics"
 	"ticket-system/repository"
 	"ticket-system/service"
-	"ticket-system/worker" // [추가] 워커 패키지
+	"ticket-system/worker"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	// 1. Redis 연결 설정 (docker-compose의 ticket-redis 사용)
+	// 1. 인프라 설정 (Redis & MySQL)
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "localhost:16379",
 	})
@@ -54,13 +54,13 @@ func main() {
 	redisRepo := &repository.RedisRepository{Client: rdb}
 	mysqlRepo := &repository.MySQLRepository{DB: db}
 
-	// [추가] Kafka Repository 생성 (Producer 역할)
+	// Kafka Repository 생성 (Producer 역할)
 	kafkaRepo := repository.NewKafkaRepository([]string{"localhost:9092"}, "ticket-topic")
 
-	// 4. [수정] Service 조립 (오류 해결: kafkaRepo 추가)
+	// 4. Service 조립 (오류 해결: kafkaRepo 추가)
 	svc := service.NewTicketService(redisRepo, mysqlRepo, kafkaRepo)
 
-	// 5. [추가] Kafka Consumer Worker 실행
+	// 5. Kafka Consumer Worker 실행
 	// 서버가 켜질 때 백그라운드에서 Kafka 메시지를 읽어 DB에 저장합니다.
 	purchaseWorker := worker.NewPurchaseWorker(
 		[]string{"localhost:9092"},
@@ -69,8 +69,8 @@ func main() {
 		mysqlRepo,
 		kafkaRepo,
 	)
-	go purchaseWorker.Start() // 고루틴으로 실행
-
+	go purchaseWorker.Start()                       // 고루틴으로 실행
+	go svc.StartPromoter(context.Background(), 100) // 100명까지 동시 예매 허용
 	go func() {
 		for {
 			time.Sleep(500 * time.Millisecond) // 1초마다 Redis 실제 값 확인

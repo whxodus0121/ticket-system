@@ -7,7 +7,8 @@ import (
 )
 
 type KafkaRepository struct {
-	Writer *kafka.Writer
+	Writer  *kafka.Writer
+	Brokers []string
 }
 
 func NewKafkaRepository(brokers []string, topic string) *KafkaRepository {
@@ -38,16 +39,6 @@ func (r *KafkaRepository) PublishCancel(userID string, ticketName string) error 
 	})
 }
 
-func (r *KafkaRepository) PublishToTopic(ctx context.Context, topic string, key, value []byte) error {
-	return r.Writer.WriteMessages(ctx,
-		kafka.Message{
-			Topic: topic, // 여기서 토픽을 지정하면 Writer 생성 시의 기본 토픽을 덮어씁니다.
-			Key:   key,
-			Value: value,
-		},
-	)
-}
-
 func (r *KafkaRepository) PublishToDLQ(ctx context.Context, key, value []byte, reason string) error {
 	return r.Writer.WriteMessages(ctx,
 		kafka.Message{
@@ -59,4 +50,19 @@ func (r *KafkaRepository) PublishToDLQ(ctx context.Context, key, value []byte, r
 			},
 		},
 	)
+}
+
+// PublishToTopic: 특정 토픽으로 메시지를 발행합니다 (DLQ 전송 등에 사용)
+func (r *KafkaRepository) PublishToTopic(ctx context.Context, topic string, key, value []byte) error {
+	writer := &kafka.Writer{
+		Addr:     kafka.TCP(r.Brokers...),
+		Topic:    topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer writer.Close()
+
+	return writer.WriteMessages(ctx, kafka.Message{
+		Key:   key,
+		Value: value,
+	})
 }

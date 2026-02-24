@@ -5,18 +5,37 @@ import (
 	"time"
 )
 
-// LockRepository는 '분산 락' 기능을 수행하기 위한 규격입니다.
+/*
+ * LockRepository Interface
+ * Redis를 기반으로 고성능 분산 락, 원자적 재고 관리, 대기열 로직을 담당합니다.
+ */
+
 type LockRepository interface {
+	// Stock Management
+	GetStock(ctx context.Context, ticketName string) (int, error)
+	DecreaseStock(ctx context.Context, ticketName string) (int, error)
+	IncreaseStock(ctx context.Context, ticketName string) (int, error)
+
+	// User Verification
+	IsUserPurchased(ctx context.Context, ticketName string, userID string) (bool, error)
+	AddPurchasedUser(ctx context.Context, ticketName string, userID string) error
+	RemovePurchasedUser(ctx context.Context, ticketName string, userID string) error
+
+	// Virtual Waiting Queue
+	TryEnterOrEnqueue(ctx context.Context, userID string, maxActive int) (string, int, error)
+	RemoveActiveUser(ctx context.Context, userID string) error
+	PromoteUsers(ctx context.Context, maxActive int) (int, error)
+
+	// Distributed Locking
 	Lock(ctx context.Context, key string, expiration time.Duration) (bool, error)
 	Unlock(ctx context.Context, key string) error
-	DecreaseStock(ctx context.Context, ticketName string) (int, error)
-	AddPurchasedUser(ctx context.Context, ticketName string, userID string) error
-	IsUserPurchased(ctx context.Context, ticketName string, userID string) (bool, error)
-	IncreaseStock(ctx context.Context, ticketName string) (int, error)               // 재고 +1
-	RemovePurchasedUser(ctx context.Context, ticketName string, userID string) error // 명단 삭제
 }
 
-// TicketRepository는 '티켓 데이터'에 접근하기 위한 규격입니다.
+/*
+ * TicketRepository Interface
+ * 최종적인 티켓 데이터 및 구매 이벤트를 RDBMS(MySQL)에 저장하는 역할을 담당합니다.
+ */
+
 type TicketRepository interface {
 	GetStock(name string) (int, error)
 	DecreaseStock(name string) error
