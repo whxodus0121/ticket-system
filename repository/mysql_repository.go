@@ -1,7 +1,6 @@
 package repository
 
 import (
-	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -85,9 +84,7 @@ func (r *MySQLRepository) DeletePurchase(userID string, ticketName string) error
 		return result.Error
 	}
 
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("취소할 내역이 없습니다 (유저: %s)", userID)
-	}
-
+	// A replay after DB success but before Kafka offset commit sees zero rows.
+	// Treating that as success makes cancellation idempotent.
 	return nil
 }

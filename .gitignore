@@ -1,0 +1,4 @@
+test_log.csv
+test_errors.csv
+*.exe
+*.log

@@ -6,175 +6,207 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"ticket-system/metrics"
 	"ticket-system/repository"
-	"time" // 재시도 대기를 위해 추가
+	"time"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/segmentio/kafka-go"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/segmentio/kafka-go"
 )
 
-var (
-	// DB 저장 성공 횟수를 기록하는 카운터
-	mysqlSaveSuccess = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "mysql_save_success_total",
-		Help: "The total number of successful MySQL saves",
-	})
-)
+var mysqlSaveSuccess = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "mysql_save_success_total",
+	Help: "The total number of successful MySQL saves",
+})
 
-type PurchaseWorker struct {
-	Reader     *kafka.Reader
-	TicketRepo repository.TicketRepository
-	KafkaRepo  *repository.KafkaRepository // DLQ 전송을 위한 레포지토리 추가
+// MessageReader is the subset of kafka.Reader needed for manual offset
+// management. A message is never committed merely because it was fetched.
+type MessageReader interface {
+	FetchMessage(ctx context.Context) (kafka.Message, error)
+	CommitMessages(ctx context.Context, messages ...kafka.Message) error
+	Close() error
 }
 
-func NewPurchaseWorker(brokers []string, topic string, groupID string, tr repository.TicketRepository, kr *repository.KafkaRepository) *PurchaseWorker {
+type PurchaseWorker struct {
+	Reader        MessageReader
+	TicketRepo    repository.TicketRepository
+	LockRepo      repository.LockRepository
+	KafkaRepo     repository.EventPublisher
+	RetryCount    int
+	RetryDelay    time.Duration
+	brokers       []string
+	recoveryGroup string
+}
+
+func NewPurchaseWorker(
+	brokers []string,
+	topic string,
+	groupID string,
+	tr repository.TicketRepository,
+	lr repository.LockRepository,
+	kr repository.EventPublisher,
+) *PurchaseWorker {
 	return &PurchaseWorker{
 		Reader: kafka.NewReader(kafka.ReaderConfig{
 			Brokers:  brokers,
 			Topic:    topic,
 			GroupID:  groupID,
-			MinBytes: 10e3,
+			MinBytes: 1,
 			MaxBytes: 10e6,
+			MaxWait:  500 * time.Millisecond,
 		}),
-		TicketRepo: tr,
-		KafkaRepo:  kr,
+		TicketRepo:    tr,
+		LockRepo:      lr,
+		KafkaRepo:     kr,
+		RetryCount:    3,
+		RetryDelay:    2 * time.Second,
+		brokers:       append([]string(nil), brokers...),
+		recoveryGroup: "recovery-group-v2",
 	}
 }
-
-/*
- * Start: Kafka 이벤트를 소비하여 DB 작업을 수행하는 소비자 루프
- * 예매 성공과 취소 이벤트를 분기하여 처리합니다.
- */
 
 func (w *PurchaseWorker) Start() {
-	fmt.Println("🚀 Kafka Consumer Worker 시작... [예매 저장/취소 처리 대기 중]")
-
-	for {
-		m, err := w.Reader.ReadMessage(context.Background())
-		if err != nil {
-			log.Printf("❌ 메시지 읽기 에러: %v", err)
-			continue
-		}
-
-		userID := string(m.Key)
-		messageVal := string(m.Value)
-
-		if strings.HasPrefix(messageVal, "CANCEL:") {
-			ticketName := strings.TrimPrefix(messageVal, "CANCEL:")
-
-			w.handleCancel(userID, ticketName, m)
-		} else {
-
-			w.handleSave(userID, messageVal, m)
-		}
+	defer w.Reader.Close()
+	if err := w.Run(context.Background()); err != nil {
+		log.Printf("consumer worker stopped without committing the failed message: %v", err)
 	}
 }
 
-func (w *PurchaseWorker) handleSave(userID string, ticketName string, rawMsg kafka.Message) {
-
-	time.Sleep(100 * time.Millisecond)
-
-	maxRetries := 3
-	var lastErr error
-
-	for i := 0; i < maxRetries; i++ {
-		saved, err := w.TicketRepo.SavePurchase(userID, ticketName)
-
-		if err == nil {
-			if !saved {
-				log.Printf("⚠️ [중복 저장 스킵] 유저 %s는 이미 처리되었습니다.", userID)
-			} else {
-				mysqlSaveSuccess.Inc()
-				fmt.Printf("✅ [저장 성공] 유저 %s의 티켓 정보 MySQL 저장 완료\n", userID)
+func (w *PurchaseWorker) Run(ctx context.Context) error {
+	log.Println("Kafka consumer worker started (manual offset commit)")
+	for {
+		if err := w.ProcessOne(ctx); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
 			}
-			return
+			// Stopping is intentional: fetching a later message and committing it
+			// could advance the partition past this uncommitted failure.
+			return err
 		}
-
-		lastErr = err
-		var mysqlErr *mysql.MySQLError
-		// 중복 키(1062)는 재시도할 필요가 없으므로 즉시 종료
-		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
-			log.Printf("⚠️ [중복 저장 스킵] 유저 %s는 이미 처리되었습니다.", userID)
-			return
-		}
-
-		log.Printf("🚨 [저장 실패] 유저 %s (재시도 %d/%d): %v", userID, i+1, maxRetries, err)
-		time.Sleep(time.Second * 2)
-	}
-
-	// [수정 포인트] image_6b283의 UnusedVar 에러 해결: 마지막 에러 정보를 로그에 활용
-	log.Printf("❌ [최종 실패] 유저 %s 메시지 DLQ 이동. 사유: %v", userID, lastErr)
-
-	// DLQ 전송 시 에러 사유를 포함해서 전송
-	err := w.KafkaRepo.PublishToTopic(context.Background(), "ticket-dlq-topic", rawMsg.Key, rawMsg.Value)
-	if err != nil {
-		log.Printf("💣 [치명적 에러] DLQ 전송 실패: %v", err)
 	}
 }
 
-func (w *PurchaseWorker) handleCancel(userID string, ticketName string, rawMsg kafka.Message) {
-	maxRetries := 3
+// ProcessOne implements the commit boundary:
+// DB success -> commit, or DB failure + DLQ success -> commit.
+// DLQ failure returns without committing the source message.
+func (w *PurchaseWorker) ProcessOne(ctx context.Context) error {
+	message, err := w.Reader.FetchMessage(ctx)
+	if err != nil {
+		return fmt.Errorf("fetch message: %w", err)
+	}
+
+	processErr := w.processMessage(ctx, message)
+	if processErr != nil {
+		dlqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		dlqErr := w.KafkaRepo.PublishToDLQ(dlqCtx, message, processErr.Error())
+		cancel()
+		if dlqErr != nil {
+			return fmt.Errorf("process source offset %d: %v; publish DLQ: %w", message.Offset, processErr, dlqErr)
+		}
+		log.Printf("message moved to DLQ (partition=%d offset=%d): %v", message.Partition, message.Offset, processErr)
+	}
+
+	commitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := w.Reader.CommitMessages(commitCtx, message); err != nil {
+		return fmt.Errorf("commit partition %d offset %d: %w", message.Partition, message.Offset, err)
+	}
+	return nil
+}
+
+func (w *PurchaseWorker) processMessage(ctx context.Context, message kafka.Message) error {
+	userID := string(message.Key)
+	value := string(message.Value)
+	if strings.HasPrefix(value, "CANCEL:") {
+		return w.handleCancel(ctx, userID, strings.TrimPrefix(value, "CANCEL:"))
+	}
+	return w.handleSave(userID, value)
+}
+
+func (w *PurchaseWorker) handleSave(userID, ticketName string) error {
 	var lastErr error
-
-	for i := 0; i < maxRetries; i++ {
-		err := w.TicketRepo.DeletePurchase(userID, ticketName)
-
+	for attempt := 1; attempt <= w.retryCount(); attempt++ {
+		saved, err := w.TicketRepo.SavePurchase(userID, ticketName)
 		if err == nil {
-			fmt.Printf("🗑️ [취소 성공] 유저 %s의 구매 내역 DB 삭제 완료\n", userID)
-			return // 성공 시 종료
+			if saved {
+				mysqlSaveSuccess.Inc()
+				log.Printf("purchase saved: user=%s ticket=%s", userID, ticketName)
+			} else {
+				log.Printf("duplicate purchase skipped: user=%s ticket=%s", userID, ticketName)
+			}
+			return nil
 		}
 
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+			return nil
+		}
 		lastErr = err
-		log.Printf("🚨 [취소 실패] 유저 %s (재시도 %d/%d): %v", userID, i+1, maxRetries, err)
-		time.Sleep(time.Second * 2) // 2초 대기
+		if attempt < w.retryCount() {
+			time.Sleep(w.RetryDelay)
+		}
 	}
-
-	// 3번 모두 실패 시 DLQ로 전송
-	log.Printf("❌ [취소 최종 실패] 유저 %s의 취소 메시지 DLQ 이동. 사유: %v", userID, lastErr)
-
-	// DLQ 토픽으로 전송
-	err := w.KafkaRepo.PublishToTopic(context.Background(), "ticket-dlq-topic", rawMsg.Key, rawMsg.Value)
-	if err != nil {
-		log.Printf("💣 [치명적 에러] 취소 DLQ 전송 실패: %v", err)
-	}
+	return fmt.Errorf("save purchase after %d attempts: %w", w.retryCount(), lastErr)
 }
 
-func (w *PurchaseWorker) ProcessDLQ() {
-	log.Println("🛠️ [DLQ 복구] 저장 실패했던 데이터를 다시 처리합니다...")
+func (w *PurchaseWorker) handleCancel(ctx context.Context, userID, ticketName string) error {
+	var lastErr error
+	for attempt := 1; attempt <= w.retryCount(); attempt++ {
+		if err := w.TicketRepo.DeletePurchase(userID, ticketName); err == nil {
+			stock, err := w.LockRepo.FinalizeCancel(ctx, ticketName, userID)
+			if err != nil {
+				return fmt.Errorf("finalize Redis cancel: %w", err)
+			}
+			metrics.TicketStockLevel.Set(float64(stock))
+			log.Printf("purchase cancelled: user=%s ticket=%s", userID, ticketName)
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt < w.retryCount() {
+			time.Sleep(w.RetryDelay)
+		}
+	}
+	return fmt.Errorf("delete purchase after %d attempts: %w", w.retryCount(), lastErr)
+}
 
-	// 복구용 리더 (그룹 ID를 다르게 해서 처음부터 읽음)
-	dlqReader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     w.Reader.Config().Brokers,
-		Topic:       "ticket-dlq-topic",
-		GroupID:     "recovery-group-v1",
-		StartOffset: kafka.FirstOffset,
+func (w *PurchaseWorker) retryCount() int {
+	if w.RetryCount <= 0 {
+		return 1
+	}
+	return w.RetryCount
+}
+
+// ProcessDLQ replays DLQ messages with manual commits. Failed replay messages
+// remain uncommitted rather than being recursively republished to the same DLQ.
+func (w *PurchaseWorker) ProcessDLQ(ctx context.Context) error {
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:  w.brokers,
+		Topic:    "ticket-dlq-topic",
+		GroupID:  w.recoveryGroup,
+		MinBytes: 1,
+		MaxBytes: 10e6,
+		MaxWait:  500 * time.Millisecond,
 	})
-	defer dlqReader.Close()
+	defer reader.Close()
 
 	for {
-		// 더 이상 읽을 메시지가 없으면 3초 뒤 종료되도록 타임아웃 설정
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		m, err := dlqReader.ReadMessage(ctx)
+		fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		message, err := reader.FetchMessage(fetchCtx)
 		cancel()
-
 		if err != nil {
-			log.Println("✅ [DLQ 복구 완료] 모든 유실 데이터를 처리했거나 남은 데이터가 없습니다.")
-			return
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil
+			}
+			return err
 		}
-
-		userID := string(m.Key)
-		messageVal := string(m.Value)
-
-		if strings.HasPrefix(messageVal, "CANCEL:") {
-			ticketName := strings.TrimPrefix(messageVal, "CANCEL:")
-			log.Printf("🔄 [DLQ 취소 재처리] 유저: %s", userID)
-			w.handleCancel(userID, ticketName, m)
-		} else {
-			log.Printf("🔄 [DLQ 저장 재처리] 유저: %s", userID)
-			w.handleSave(userID, messageVal, m)
+		if err := w.processMessage(ctx, message); err != nil {
+			return fmt.Errorf("replay DLQ offset %d without commit: %w", message.Offset, err)
+		}
+		if err := reader.CommitMessages(ctx, message); err != nil {
+			return fmt.Errorf("commit DLQ offset %d: %w", message.Offset, err)
 		}
 	}
 }

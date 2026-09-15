@@ -38,7 +38,7 @@ func (r *RedisRepository) DecreaseStock(ctx context.Context, ticketName string) 
 		end
 	`
 
-	// Eval 명령어로 스크립트 실행
+	// Eval
 	val, err := r.Client.Eval(ctx, script, []string{key}).Int()
 	if err != nil {
 		return -1, err
@@ -50,6 +50,143 @@ func (r *RedisRepository) DecreaseStock(ctx context.Context, ticketName string) 
 	}
 
 	return val, nil
+}
+
+const (
+	PurchaseReserved         = "SUCCESS"
+	PurchaseAlreadyPurchased = "ALREADY_PURCHASED"
+	PurchaseSoldOut          = "SOLD_OUT"
+	CancelPending            = "PENDING"
+	CancelAlreadyPending     = "ALREADY_PENDING"
+	CancelNotPurchased       = "NOT_PURCHASED"
+)
+
+var reservePurchaseScript = redis.NewScript(`
+    local stock_key = KEYS[1]
+    local purchased_key = KEYS[2]
+    local user_id = ARGV[1]
+
+    if redis.call("SISMEMBER", purchased_key, user_id) == 1 then
+        local stock = tonumber(redis.call("GET", stock_key) or "0")
+        return {"ALREADY_PURCHASED", stock}
+    end
+
+    local stock = tonumber(redis.call("GET", stock_key) or "0")
+    if stock <= 0 then
+        return {"SOLD_OUT", stock}
+    end
+
+    local remaining = redis.call("DECR", stock_key)
+    redis.call("SADD", purchased_key, user_id)
+    return {"SUCCESS", remaining}
+`)
+
+// ReservePurchase atomically checks duplicate purchase state, checks stock,
+// decrements stock, and records the purchaser.
+func (r *RedisRepository) ReservePurchase(ctx context.Context, ticketName, userID string) (string, int, error) {
+	result, err := reservePurchaseScript.Run(ctx, r.Client,
+		[]string{"ticket_stock:" + ticketName, "purchased_users:" + ticketName}, userID).Result()
+	if err != nil {
+		return "", 0, err
+	}
+	return parseStatusAndNumber(result)
+}
+
+var rollbackPurchaseScript = redis.NewScript(`
+    local stock_key = KEYS[1]
+    local purchased_key = KEYS[2]
+    local pending_cancel_key = KEYS[3]
+    local user_id = ARGV[1]
+
+    redis.call("SREM", pending_cancel_key, user_id)
+    if redis.call("SREM", purchased_key, user_id) == 1 then
+        return redis.call("INCR", stock_key)
+    end
+    return tonumber(redis.call("GET", stock_key) or "0")
+`)
+
+// RollbackPurchase compensates a failed Kafka publish without incrementing the
+// stock twice when the rollback is retried.
+func (r *RedisRepository) RollbackPurchase(ctx context.Context, ticketName, userID string) (int, error) {
+	return rollbackPurchaseScript.Run(ctx, r.Client, []string{
+		"ticket_stock:" + ticketName,
+		"purchased_users:" + ticketName,
+		"pending_cancels:" + ticketName,
+	}, userID).Int()
+}
+
+var beginCancelScript = redis.NewScript(`
+    local purchased_key = KEYS[1]
+    local pending_cancel_key = KEYS[2]
+    local user_id = ARGV[1]
+
+    if redis.call("SISMEMBER", purchased_key, user_id) == 0 then
+        return "NOT_PURCHASED"
+    end
+    if redis.call("SISMEMBER", pending_cancel_key, user_id) == 1 then
+        return "ALREADY_PENDING"
+    end
+    redis.call("SADD", pending_cancel_key, user_id)
+    return "PENDING"
+`)
+
+// BeginCancel marks a cancellation as pending without releasing stock. Stock is
+// released only after the ordered cancel event has been persisted by the worker.
+func (r *RedisRepository) BeginCancel(ctx context.Context, ticketName, userID string) (string, error) {
+	return beginCancelScript.Run(ctx, r.Client, []string{
+		"purchased_users:" + ticketName,
+		"pending_cancels:" + ticketName,
+	}, userID).Text()
+}
+
+func (r *RedisRepository) AbortCancel(ctx context.Context, ticketName, userID string) error {
+	return r.Client.SRem(ctx, "pending_cancels:"+ticketName, userID).Err()
+}
+
+var finalizeCancelScript = redis.NewScript(`
+    local stock_key = KEYS[1]
+    local purchased_key = KEYS[2]
+    local pending_cancel_key = KEYS[3]
+    local user_id = ARGV[1]
+
+    if redis.call("SREM", pending_cancel_key, user_id) == 0 then
+        return tonumber(redis.call("GET", stock_key) or "0")
+    end
+    if redis.call("SREM", purchased_key, user_id) == 1 then
+        return redis.call("INCR", stock_key)
+    end
+    return tonumber(redis.call("GET", stock_key) or "0")
+`)
+
+// FinalizeCancel is idempotent. A redelivered cancel cannot increment stock
+// twice because only a pending cancellation may release a purchased seat.
+func (r *RedisRepository) FinalizeCancel(ctx context.Context, ticketName, userID string) (int, error) {
+	return finalizeCancelScript.Run(ctx, r.Client, []string{
+		"ticket_stock:" + ticketName,
+		"purchased_users:" + ticketName,
+		"pending_cancels:" + ticketName,
+	}, userID).Int()
+}
+
+func parseStatusAndNumber(result interface{}) (string, int, error) {
+	values, ok := result.([]interface{})
+	if !ok || len(values) != 2 {
+		return "", 0, fmt.Errorf("unexpected lua script result: %T", result)
+	}
+	status, ok := values[0].(string)
+	if !ok {
+		return "", 0, fmt.Errorf("unexpected lua status type: %T", values[0])
+	}
+	var number int
+	switch value := values[1].(type) {
+	case int64:
+		number = int(value)
+	case int:
+		number = value
+	default:
+		return "", 0, fmt.Errorf("unexpected lua number type: %T", values[1])
+	}
+	return status, number, nil
 }
 
 func (r *RedisRepository) AddPurchasedUser(ctx context.Context, ticketName string, userID string) error {

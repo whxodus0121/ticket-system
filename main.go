@@ -27,11 +27,16 @@ func main() {
 	ctx := context.Background()
 	stockKey := "ticket_stock:concert_2026"
 
-	// 값이 없을 때만 1000으로 초기화
-	rdb.Set(ctx, stockKey, 1000, 0)
-	rdb.Del(ctx, "purchased_users:concert_2026")
-
-	metrics.TicketStockLevel.Set(1000)
+	// 서버 재시작이 기존 재고와 구매자를 지우지 않도록 최초 실행에서만
+	// 재고를 초기화합니다.
+	if err := rdb.SetNX(ctx, stockKey, 1000, 0).Err(); err != nil {
+		log.Fatal("Redis 재고 초기화 실패: ", err)
+	}
+	currentStock, err := rdb.Get(ctx, stockKey).Int()
+	if err != nil {
+		log.Fatal("Redis 재고 조회 실패: ", err)
+	}
+	metrics.TicketStockLevel.Set(float64(currentStock))
 
 	// 2. MySQL 연결 설정 (docker-compose의 ticket-mysql 사용)
 	// 비밀번호와 DB명은 docker-compose.yml 설정과 동일하게 유지
@@ -60,16 +65,17 @@ func main() {
 	// 4. Service 조립 (오류 해결: kafkaRepo 추가)
 	svc := service.NewTicketService(redisRepo, mysqlRepo, kafkaRepo)
 
-	// 5. Kafka Consumer Worker 실행
-	// 서버가 켜질 때 백그라운드에서 Kafka 메시지를 읽어 DB에 저장합니다.
-	purchaseWorker := worker.NewPurchaseWorker(
+	// Source topic 소비는 cmd/worker 프로세스 한 곳에서만 수행합니다.
+	// API와 별도 worker를 함께 실행했을 때 서로 다른 consumer group으로
+	// 같은 이벤트를 중복 처리하던 기존 구성을 제거했습니다.
+	recoveryWorker := worker.NewPurchaseWorker(
 		[]string{"localhost:9092"},
 		"ticket-topic",
-		"purchase-group",
+		"ticket-group",
 		mysqlRepo,
+		redisRepo,
 		kafkaRepo,
 	)
-	go purchaseWorker.Start()                       // 고루틴으로 실행
 	go svc.StartPromoter(context.Background(), 100) // 100명까지 동시 예매 허용
 	go func() {
 		for {
@@ -109,7 +115,7 @@ func main() {
 			return
 		}
 
-		success, message := svc.CancelTicket(userID)
+		success, message := svc.CancelTicket(r.Context(), userID)
 		if !success {
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprintf(w, `{"error": "%s"}`, message)
@@ -121,8 +127,23 @@ func main() {
 	})
 
 	mux.HandleFunc("/admin/recover-dlq", func(w http.ResponseWriter, r *http.Request) {
-		go purchaseWorker.ProcessDLQ() // 별도 고루틴으로 실행
+		go func() {
+			if err := recoveryWorker.ProcessDLQ(context.Background()); err != nil {
+				log.Printf("DLQ 복구 중단: %v", err)
+			}
+		}()
 		fmt.Fprint(w, `{"message": "DLQ 복구 프로세스가 시작되었습니다."}`)
+	})
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			http.Error(w, "redis unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"status":"ok"}`)
 	})
 
 	// 8. 서버 실행 설정
