@@ -65,7 +65,10 @@ flowchart LR
     Kafka -->|same group<br/>manual commit| W3[Worker 3]
     W1 & W2 & W3 --> MySQL[(MySQL)]
     W1 & W2 & W3 -->|DB retry exhausted| DLQ[(DLQ)]
-    DLQ -->|manual replay| MySQL
+    API -.->|/admin/recover-dlq| Replay[DLQ replay worker<br/>ProcessDLQ]
+    DLQ -->|FetchMessage| Replay
+    Replay -->|same BUY/CANCEL processing| MySQL
+    Replay -->|CANCEL finalize| Redis
 ```
 
 - API: Redis 상태 변경과 Kafka 이벤트 발행
@@ -108,7 +111,7 @@ flowchart LR
 - **문제:** `MySQL COMMIT → worker failure → offset 미commit`이면 동일 Kafka record가 재전달됩니다.
 - **재현:** 실제 Kafka record를 처리해 MySQL 반영을 완료한 직후 `CommitMessages`만 결정적으로 실패시키고 같은 group의 worker를 다시 시작합니다.
 - **원인:** Kafka offset과 외부 MySQL commit은 원자적으로 묶을 수 없습니다.
-- **해결:** BUY는 `(user_id, ticket_name)` UNIQUE + `ON CONFLICT DO NOTHING`, CANCEL은 0-row DELETE를 성공으로 취급합니다. 취소의 Redis finalize는 pending member를 제거한 첫 호출만 구매자 제거와 `INCR`를 수행합니다.
+- **해결:** BUY는 `(user_id, ticket_name)` UNIQUE constraint와 GORM의 `clause.OnConflict{DoNothing: true}`를 사용해 중복 INSERT를 no-op으로 처리합니다. CANCEL은 0-row DELETE를 성공으로 취급합니다. 취소의 Redis finalize는 pending member를 제거한 첫 호출에서만 구매자 제거와 재고 증가를 수행합니다.
 - **검증:** BUY는 첫 처리와 재전달 뒤 모두 MySQL row 1개, CANCEL은 두 번 처리해도 MySQL row 0개와 Redis stock 1회 증가만 남고, 재처리 뒤 source offset이 진행됩니다.
 - **남은 한계:** 이것은 현재 BUY/CANCEL 효과와 동일 record의 재전달에 대한 멱등성입니다. 결제·감사 로그 같은 새 비멱등 효과가 추가되거나 같은 `eventId`의 payload 충돌을 탐지해야 한다면 Lab의 transactional `processed_events` 방식이 필요합니다.
 
@@ -136,7 +139,7 @@ Kafka FetchMessage
 
 | Event | 첫 처리 | 동일 record 재처리 | 남는 효과 |
 |---|---|---|---|
-| BUY | purchase INSERT | UNIQUE 충돌을 `DO NOTHING`으로 처리 | purchase row 1개 |
+| BUY | purchase INSERT | UNIQUE 충돌 시 GORM의 `clause.OnConflict{DoNothing: true}`가 중복 INSERT를 no-op으로 처리 | purchase row 1개 |
 | CANCEL | 조건 DELETE + Redis finalize | 0-row DELETE 성공, pending 부재 시 Lua no-op | row 0개, stock 1회 증가 |
 
 `processed_events`는 marker INSERT, transaction, 인덱스 보존과 duplicate 조회 비용을 추가합니다. 현재처럼 비즈니스 상태 자체가 동일 record를 충분히 식별하고 연산이 멱등한 경우에는 이 비용이 실질적 안전성을 늘리지 않습니다. 반대로 side effect가 누적형 UPDATE이거나 이벤트 identity와 payload 충돌 검사가 필요해지면 `eventId` 등록과 business update를 같은 MySQL transaction에 두어야 합니다. Redis나 메모리의 별도 marker는 MySQL commit과 다시 분리되므로 대안이 아닙니다.
@@ -213,6 +216,8 @@ Test environment:
 | Final Redis stock / purchasers | 0 / 1,000 |
 | Final MySQL purchase rows | 1,000 |
 | Kafka source lag after drain | 0 |
+
+낮은 2xx 비율은 시스템 오류 때문이 아니라 초기 재고를 1,000개로 제한한 테스트 조건에 따른 결과입니다. 재고 소진 이후 49,000건은 의도된 `410 Sold Out` 응답이며 transport error는 0건이었습니다.
 
 `latency_ms`는 각 HTTP 요청 직전부터 응답 또는 transport error까지의 시간입니다. 원본 요청별 결과는 `test_log.csv`, transport error는 `test_errors.csv`에 기록됩니다.
 
