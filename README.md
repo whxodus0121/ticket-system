@@ -1,251 +1,168 @@
-# Ticket System v8
+# 🎫 티켓 예매 동시성 제어 프로젝트 (Ticket-System)
 
-Redis, Kafka, MySQL을 이용해 티켓 구매와 취소를 비동기로 처리하는 Go 프로젝트입니다. 목표는 높은 수치를 주장하는 것이 아니라 동시 요청과 장애 상황에서 **무엇을 보장하고 무엇을 아직 보장하지 못하는지**를 코드와 재현 가능한 검증으로 설명하는 것입니다.
+동시 예매에서 시작해 중복 구매, 동기식 DB 쓰기 병목, 비동기 처리의 장애 경계를 차례로 다룬 Go 백엔드 프로젝트입니다. 각 버전은 앞 단계에서 확인한 문제를 해결하기 위해 만들어졌습니다. 현재 구현과 과거 태그의 기능은 구분해서 설명합니다.
 
-## Development journey
-
-이 저장소의 v7까지는 티켓 예매 도메인에 Redis 동시성 제어, Kafka 비동기 처리, MySQL 영속화와 DLQ 기반 실패 메시지 격리를 구현했습니다. 그러나 DLQ 전송만으로 장애 처리가 끝나는지, MySQL commit과 Kafka offset commit 사이에서 worker가 죽으면 어떤 상태가 남는지, Retry와 Replay가 복구 중인 시스템에 어떤 부하를 만드는지는 충분히 검증하지 못했습니다.
-
-이 질문은 별도 프로젝트인 [kafka-recovery-lab](https://github.com/whxodus0121/kafka-recovery-lab)에서 at-least-once delivery, manual commit, `eventId` 기반 idempotent consumer, Retry/DLQ/Replay, Backoff/Jitter, Retry Storm과 Recovery rate control을 단계별로 재현하며 다뤘습니다.
-
-그 결과를 다시 [ticket-system](https://github.com/whxodus0121/ticket-system) v8에 적용할 때는 Lab 전체를 복사하지 않고 실제 예매 시스템에 필요한 경계만 선택했습니다.
-
-```text
-ticket-system v1~v7
-  Redis/Kafka/MySQL 기반 예매와 DLQ 격리
-        ↓ 남은 장애 경계 질문
-kafka-recovery-lab
-  재전달, idempotency, Retry/DLQ/Replay와 복구 부하 실험
-        ↓ 도메인에 필요한 결과만 선택
-ticket-system v8
-  atomic reservation/cancel, user ordering, manual commit,
-  destination-success/source-commit 경계, crash redelivery 검증
-```
-
-### Version history
-
-| Version | Focus |
-|---|---|
-| v1.0 | Docker 기반 Redis/MySQL 연결과 기본 구매 흐름 |
-| v2.0 | Redis lock과 DB connection pool을 이용한 초과 판매 방어 |
-| v3.0 | 동일 사용자의 중복 구매 방지 |
-| v4.0 | 구매 취소 흐름과 동기 MySQL write 병목 확인 |
-| v4.5 | Kafka 비동기 MySQL 저장과 DB UNIQUE 기반 중복 방어 |
-| v5.0 | Redis Lua 재고 연산, 비동기 취소와 DLQ 격리 |
-| v6.0 | 기본 Prometheus/Grafana 관측과 부하 실험 |
-| v7.0 | Redis Sorted Set 기반 virtual waiting queue |
-| v8.0 | Redis 상태 전이 원자화, 사용자 단위 Kafka 순서, manual commit과 장애 경계 검증 |
-
-### 두 프로젝트의 책임 경계
-
-| Recovery Lab 개념 | ticket-system v8 반영 | 설명 |
-|---|---|---|
-| At-least-once delivery | 적용 | commit 응답 유실과 worker 재시작 시 재전달을 허용하고 부수효과를 멱등하게 처리합니다. |
-| `FetchMessage` + manual commit | 적용 | DB 성공 또는 DLQ 발행 성공 뒤에만 source offset을 commit합니다. |
-| Destination publish 후 source commit | 적용 | DLQ 발행 실패 시 source offset을 남깁니다. |
-| Worker crash / redelivery 검증 | 적용 | 실제 Kafka·MySQL에서 DB 반영 뒤 commit 실패를 주입하고 같은 record를 재처리합니다. |
-| `eventId` + `processed_events` | 미적용 | 현재 BUY/CANCEL 효과는 UNIQUE INSERT, idempotent DELETE/Lua로 동일 record 재처리에 안전해 추가 테이블의 비용을 선택하지 않았습니다. |
-| Retryable / Non-Retryable 분류 | Lab 전용 | v8의 단순한 동일 프로세스 재시도와 달리 오류 분류 정책 실험은 Lab에 남깁니다. |
-| Retry Topic / Retry Worker | Lab 전용 | ticket-system에는 새 topic과 worker를 추가하지 않았습니다. |
-| Fixed / Exponential / Full Jitter | Lab 전용 | 전략별 Retry Storm 비교는 Lab의 실험 범위입니다. |
-| Selective/Bulk DLQ Replay | Lab 전용 | v8은 관리 endpoint의 단순 수동 replay만 제공합니다. |
-| Recovery Topic / rate limiting | Lab 전용 | 복구 발행률·처리율 제한은 Lab의 차별화된 범위입니다. |
-| Recovery 전용 Prometheus/Grafana 실험 | Lab 전용 | v8은 기존의 기본 앱 지표만 유지하며 Lab의 복구 지표와 대시보드를 이식하지 않았습니다. |
-| Redis concurrency / user partition ordering | ticket-system 전용 | 실제 예매 도메인의 재고 경쟁과 BUY/CANCEL 순서를 다룹니다. |
-
-## Architecture
+## 전체 아키텍처
 
 ```mermaid
-flowchart LR
-    Client --> API[Go API]
-    API -->|atomic reserve / pending cancel| Redis[(Redis)]
-    API -->|key = userID| Kafka{Kafka<br/>3 partitions}
-    Kafka -->|same group<br/>manual commit| W1[Worker 1]
-    Kafka -->|same group<br/>manual commit| W2[Worker 2]
-    Kafka -->|same group<br/>manual commit| W3[Worker 3]
-    W1 & W2 & W3 --> MySQL[(MySQL)]
-    W1 & W2 & W3 -->|DB retry exhausted| DLQ[(DLQ)]
-    API -.->|/admin/recover-dlq| Replay[DLQ replay worker<br/>ProcessDLQ]
-    DLQ -->|FetchMessage| Replay
-    Replay -->|same BUY/CANCEL processing| MySQL
-    Replay -->|CANCEL finalize| Redis
+graph TD
+    User((Client)) -->|예매·취소 요청| API[Go API Server]
+
+    subgraph Redis_Layer [Redis: 진입과 상태 관리]
+        API -->|WAITING 순번·ACTIVE 제한| WaitingQueue[(Sorted Set / Active Set)]
+        API -->|Lua: 구매 예약·취소 pending| Redis[(재고 / 구매자 / pending)]
+    end
+
+    subgraph Message_Broker [Kafka 비동기 파이프라인]
+        API -->|BUY·CANCEL, key=userID| Kafka{ticket-topic<br/>3 partitions}
+        Kafka -->|같은 consumer group<br/>처리 후 manual commit| Worker[Purchase Workers]
+        Worker -->|DB 실패 후 재시도 소진<br/>DLQ 발행 성공 시 source commit| DLQ[ticket-dlq-topic]
+        DLQ -->|관리 엔드포인트에서 수동 재처리| Recovery[DLQ Recovery Worker]
+    end
+
+    subgraph Database_Layer [영속화]
+        Worker -->|BUY INSERT / CANCEL DELETE| MySQL[(MySQL purchases)]
+        Recovery -->|동일 BUY·CANCEL 처리| MySQL
+        Recovery -->|CANCEL 최종 상태 반영| Redis
+    end
+
+    subgraph Monitoring_Layer [관측]
+        API -.-> Prometheus[Prometheus]
+        Worker -.-> Prometheus
+        Prometheus -.-> Grafana[Grafana]
+    end
 ```
 
-- API: Redis 상태 변경과 Kafka 이벤트 발행
-- Redis: 재고, 구매자, 취소 pending 상태
-- Kafka: `ticket-topic`과 `ticket-dlq-topic`, 각각 3 partitions
-- Worker: 동일 consumer group의 3개 consumer가 MySQL 처리를 병렬 수행
-- MySQL: 최종 구매 내역과 `(user_id, ticket_name)` UNIQUE constraint
+API는 Redis에서 진입·재고 상태를 처리하고 Kafka에 이벤트를 발행합니다. 별도 워커 프로세스의 3개 consumer가 **같은** `ticket-group`에서 MySQL을 갱신합니다. DB 처리가 실패하면 DLQ로 격리하고, `/admin/recover-dlq`로 수동 재처리를 시작할 수 있습니다. 이 엔드포인트의 응답은 재처리 **시작**을 뜻하며 복구 완료를 뜻하지 않습니다.
 
-## v8 reliability story
+## 📌 버전별 개발 기록
 
-### 1. Concurrent purchase
+### 🔴 v1.0: 인프라 구축과 기본 예매 흐름
 
-- **문제:** 중복 확인, 재고 확인, 감소와 구매자 등록을 별도 Redis 명령으로 실행하면 같은 사용자의 동시 요청이 모두 통과할 수 있습니다.
-- **재현:** 같은 사용자의 구매 요청 20개와 재고 10개에 대한 서로 다른 사용자 요청 50개를 동시에 보냅니다.
-- **원인:** 여러 Redis 명령 사이에 다른 요청이 끼어드는 check-then-act race입니다.
-- **해결:** 하나의 Lua script가 `SISMEMBER → stock 확인 → DECR + SADD`를 원자적으로 수행합니다. Kafka 발행 실패 보상도 한 번만 재고를 복구하는 Lua script로 처리합니다.
-- **검증:** 동일 사용자는 1건만 성공하고, 재고 10개는 정확히 10건만 성공하며 stock이 음수가 되지 않았습니다.
-- **남은 한계:** Redis 예약 성공 직후 Kafka 발행 전에 프로세스가 종료되는 경계는 원자적이지 않습니다.
+Docker로 Redis·MySQL을 띄우고 Go API에서 구매 요청을 받아 재고를 확인·차감하는 기본 흐름을 만들었습니다. 초기 동시성 제어에는 Redis `SETNX` 락을 사용했습니다. 기능은 연결됐지만, 동시 요청이 몰릴 때 DB 연결과 재고 처리의 동작을 더 확인해야 했습니다.
 
-### 2. Kafka ordering
+### 🟡 v2.0: 동시 요청과 DB 연결 폭주 대응
 
-- **문제:** 같은 사용자의 BUY와 CANCEL이 다른 partition으로 가면 여러 worker에서 CANCEL이 먼저 처리될 수 있습니다.
-- **재현:** 3 partitions와 여러 worker 상태에서 동일 사용자의 BUY 직후 CANCEL을 반복합니다.
-- **원인:** key를 고려하지 않는 partition 선택은 사용자 단위 순서를 보장하지 않습니다.
-- **해결:** 모든 구매·취소 record의 key를 `userID`로 지정하고 `kafka.Hash` partitioner를 사용합니다.
-- **검증:** 동일 user의 BUY/CANCEL은 같은 partition으로 계산되며, 20개 동시 사용자 흐름의 최종 MySQL 구매 행과 Redis 구매/pending 상태가 모두 0으로 수렴했습니다.
-- **남은 한계:** 특정 key에 트래픽이 집중되면 hot partition이 될 수 있고, DLQ replay와 source의 최신 이벤트 사이 순서는 별도 문제입니다.
+동시 예매에서 재고보다 많은 판매가 일어나지 않도록 Redis 락으로 재고 차감 구간을 보호하고, MySQL 연결 풀(`MaxOpenConns=100`, `MaxIdleConns=50`)을 설정했습니다. 구매 내역 저장도 추가했습니다. 이 단계의 목표는 **초과 판매를 막는 것**이었지만, 서로 다른 요청이 같은 사용자에게서 오면 1인 1매 정책까지 만족하는지는 별도 문제였습니다. 과거 README의 “동시에 1,000명 접속”은 당시 로컬 부하 시나리오의 설정값이지 운영 환경 보장은 아닙니다.
 
-### 3. Message loss and DLQ boundary
+### 🟢 v3.0: 동일 사용자 중복 구매 방어
 
-- **문제:** 비즈니스 처리 전에 offset이 진행되거나 DLQ 발행 실패에도 source를 commit하면 record를 잃습니다.
-- **재현:** MySQL 중단과 도달할 수 없는 DLQ broker를 각각 주입합니다.
-- **원인:** source consume, MySQL transaction, destination publish와 offset commit은 하나의 원자적 transaction이 아닙니다.
-- **해결:** `FetchMessage`로 읽고 MySQL 성공 또는 DLQ 발행 성공 뒤에만 `CommitMessages`를 호출합니다. DB와 DLQ가 모두 실패하면 commit하지 않고 worker를 중단합니다.
-- **검증:** DB 실패는 source 좌표 header를 가진 DLQ record로 이동한 뒤 source lag 0이 되었고, DLQ 발행 실패는 새 consumer에서 같은 source record가 다시 전달됐습니다.
-- **남은 한계:** DLQ 발행 성공 후 source commit 응답이 유실되면 destination duplicate가 생길 수 있습니다. 이 프로젝트는 exactly-once를 주장하지 않습니다.
+재고가 남아 있어도 같은 사용자가 여러 번 요청하면 구매 행이 중복될 수 있었습니다. 락 획득 전·후에 구매 이력을 다시 확인해, 확인과 저장 사이에 다른 요청이 끼어드는 경우를 줄였습니다. 동시에 구매 이력 조회와 저장이 MySQL에 의존해 동기식 처리의 비용이 커지는 지점도 드러났습니다.
 
-### 4. Duplicate delivery
+### 🔵 v4.0: 취소 흐름과 동기식 쓰기의 한계
 
-- **문제:** `MySQL COMMIT → worker failure → offset 미commit`이면 동일 Kafka record가 재전달됩니다.
-- **재현:** 실제 Kafka record를 처리해 MySQL 반영을 완료한 직후 `CommitMessages`만 결정적으로 실패시키고 같은 group의 worker를 다시 시작합니다.
-- **원인:** Kafka offset과 외부 MySQL commit은 원자적으로 묶을 수 없습니다.
-- **해결:** BUY는 `(user_id, ticket_name)` UNIQUE constraint와 GORM의 `clause.OnConflict{DoNothing: true}`를 사용해 중복 INSERT를 no-op으로 처리합니다. CANCEL은 0-row DELETE를 성공으로 취급합니다. 취소의 Redis finalize는 pending member를 제거한 첫 호출에서만 구매자 제거와 재고 증가를 수행합니다.
-- **검증:** BUY는 첫 처리와 재전달 뒤 모두 MySQL row 1개, CANCEL은 두 번 처리해도 MySQL row 0개와 Redis stock 1회 증가만 남고, 재처리 뒤 source offset이 진행됩니다.
-- **남은 한계:** 이것은 현재 BUY/CANCEL 효과와 동일 record의 재전달에 대한 멱등성입니다. 결제·감사 로그 같은 새 비멱등 효과가 추가되거나 같은 `eventId`의 payload 충돌을 탐지해야 한다면 Lab의 transactional `processed_events` 방식이 필요합니다.
+구매 내역 삭제 후 Redis 재고와 구매자 상태를 되돌리는 취소 흐름을 추가했습니다. Redis 재고 차감과 MySQL 구매 저장이 요청 경로에 함께 남아 있어, 쓰기 지연은 그대로 API 응답 지연으로 이어졌습니다. 과거 테스트에서 MySQL `INSERT`의 Slow SQL을 관찰했고, API 요청과 DB 쓰기를 분리할 필요가 생겼습니다. 이 단계의 순차적 취소는 DB와 Redis를 하나의 트랜잭션으로 묶은 것은 아니었습니다.
 
-### 5. Load test interpretation
+### 🟣 v4.5: Kafka로 API와 MySQL 쓰기 분리
 
-- **문제:** 50,000 사용자를 실행했다는 사실을 `50,000 TPS`로 표현하면 사용자 흐름, HTTP 요청 수와 처리율을 혼동합니다.
-- **재현:** 로컬 Docker에서 사용자 흐름 50,000개, 동시성 300, 초기 재고 1,000으로 실행합니다.
-- **원인:** 대기 polling으로 한 사용자 흐름이 여러 HTTP 요청을 만들며, 누적 사용자 수는 초당 처리량이 아닙니다.
-- **해결:** 각 HTTP 요청 직전부터 응답까지 latency를 측정하고 실제 attempt 수와 총 duration으로 req/s를 계산합니다.
-- **검증:** 51,540 attempts, 12.745초, 4,044.06 req/s, transport error 0이며 Redis 구매자·MySQL 행은 각각 1,000, source lag는 0이었습니다.
-- **남은 한계:** p99 999.260ms의 원인은 이번 측정으로 입증하지 못했으며 tail latency 추가 분석 대상입니다. 로컬 1회 결과를 운영 성능으로 일반화하지 않습니다.
+API가 구매 이벤트를 Kafka에 발행하고 별도 워커가 MySQL에 저장하는 비동기 쓰기 구조로 바꿨습니다. 요청 경로에서 MySQL `INSERT`를 기다리지 않게 됐지만, API의 성공 응답은 이 시점에 **Kafka 발행·Redis 예약 성공**을 뜻하며 MySQL 영속화 완료를 뜻하지 않습니다.
 
-## Consumer idempotency decision
+중복 이벤트에 대비해 `purchases(user_id, ticket_name)` UNIQUE 제약과 GORM `clause.OnConflict{DoNothing: true}`를 사용했습니다. 같은 구매를 다시 저장하려 하면 UNIQUE 충돌에 따른 INSERT가 no-op이 됩니다. 다만 당시의 소비·오프셋 처리만으로 장애 후 재전달의 모든 경계가 검증된 것은 아니었습니다.
 
-현재 failure window는 다음과 같습니다.
+### 🟤 v5.0: 재고 보호 Lua와 비동기 취소
 
-```text
-Kafka FetchMessage
-→ MySQL business operation commit
-→ offset commit 실패 또는 worker crash
-→ 같은 topic/partition/offset 재전달
-```
+단순 `DECR`만 사용하면 매진 직후 경쟁 요청으로 재고가 음수가 될 수 있어, 재고 확인과 차감을 Redis Lua 스크립트로 묶었습니다. 취소도 Kafka 이벤트를 통해 DB 삭제를 비동기로 처리하도록 바꿨습니다. 그러나 당시에는 Redis의 구매자·취소 상태와 Kafka 발행의 관계, DB 장애 시 메시지 처리 경계를 충분히 다루지 못했습니다.
 
-현재 도메인에서는 별도 `processed_events`를 추가하지 않았습니다.
+과거 README는 DLQ까지 v5.0에 묶어 설명했지만 **실제 v5.0 태그에는 DLQ가 없고**, 아래 재시도·DLQ 처리는 v6.0 코드에서 확인됩니다.
 
-| Event | 첫 처리 | 동일 record 재처리 | 남는 효과 |
-|---|---|---|---|
-| BUY | purchase INSERT | UNIQUE 충돌 시 GORM의 `clause.OnConflict{DoNothing: true}`가 중복 INSERT를 no-op으로 처리 | purchase row 1개 |
-| CANCEL | 조건 DELETE + Redis finalize | 0-row DELETE 성공, pending 부재 시 Lua no-op | row 0개, stock 1회 증가 |
+### ⚪ v6.0: 실패 메시지 격리와 관측
 
-`processed_events`는 marker INSERT, transaction, 인덱스 보존과 duplicate 조회 비용을 추가합니다. 현재처럼 비즈니스 상태 자체가 동일 record를 충분히 식별하고 연산이 멱등한 경우에는 이 비용이 실질적 안전성을 늘리지 않습니다. 반대로 side effect가 누적형 UPDATE이거나 이벤트 identity와 payload 충돌 검사가 필요해지면 `eventId` 등록과 business update를 같은 MySQL transaction에 두어야 합니다. Redis나 메모리의 별도 marker는 MySQL commit과 다시 분리되므로 대안이 아닙니다.
+MySQL 작업이 실패하면 제한된 횟수로 재시도한 뒤 `ticket-dlq-topic`으로 보내는 흐름을 추가했습니다. DB를 중단해 실패 메시지가 DLQ에 들어가는 모습과, DB 복구 뒤 관리 경로로 재처리되는 모습을 캡처했습니다. DLQ 저장만으로 복구가 끝나는 것은 아닙니다.
 
-## Verification
+![MySQL 중단 후 DLQ에 격리된 메시지](./images/DLQ_1.jpg)
 
-### Automated and integration tests
+![MySQL 복구 후 DLQ 메시지 재처리](./images/DLQ_2.jpg)
 
-```powershell
-go test ./...
-go vet ./...
+Prometheus 메트릭과 Grafana 대시보드를 더해 요청·저장 흐름을 관찰했습니다. 아래 화면은 당시 로컬 실행의 추이를 보여줍니다. 그래프만으로 모든 메시지의 영속화나 장애 복구 완료를 증명하지는 않습니다.
 
-$env:REDIS_INTEGRATION_ADDR = "127.0.0.1:16379"
-$env:KAFKA_INTEGRATION_BROKER = "127.0.0.1:9092"
-$env:MYSQL_INTEGRATION_DSN = "root:password123@tcp(127.0.0.1:3306)/ticket_db?charset=utf8mb4&parseTime=True&loc=Local"
-go test ./repository ./worker -count=1 -v
-```
+![v6 로컬 부하 실행의 Grafana 화면](./images/grafana_result_v6.jpg)
 
-환경 변수가 없으면 외부 인프라가 필요한 integration test만 skip됩니다. 단위 테스트는 DB/DLQ 성공 여부와 source commit 경계를 확인하고, integration test는 실제 Redis/Kafka/MySQL에서 다음을 확인합니다.
+### ⚫ v7.x: Virtual Waiting Queue로 진입 부하 조절
 
-- Redis 중복 구매와 sold-out 원자성
-- DB 실패 + DLQ 실패 시 source record 재전달
-- DB commit 뒤 offset commit 실패 시 동일 BUY/CANCEL record 재전달과 단일 side effect
-- 재처리 성공 뒤 source offset 진행
+동시 요청을 무제한으로 예매 구간에 넣는 대신 Redis Sorted Set에 WAITING 사용자를 두고 순번을 반환하며, ACTIVE 사용자 수를 제한하는 진입 제어를 추가했습니다. promoter가 대기 사용자를 ACTIVE로 옮긴 뒤 예매를 진행합니다. WAITING 응답은 구매 확정이 아닙니다.
 
-### Docker Compose E2E result
+이 기능은 **v7.0 태그 자체가 아니라 태그 직후 `c08dce4` 커밋**에서 추가됐습니다. 이전 README의 “v7.0에서 최종 완성”이라는 표현은 태그 이력과도, 남은 장애 경계와도 맞지 않아 여기서는 후속 고도화로 구분합니다.
 
-2026-09-15 로컬 Docker Compose E2E 결과와 2026-09-16 추가 장애 경계 integration 결과입니다.
+![대기열 사용자가 ACTIVE로 이동하는 promoter 로그](./images/Promoter_log.jpg)
 
-| Scenario | Observed result | Result |
-|---|---|---|
-| Normal purchase | HTTP 200, Redis stock `5→4`, purchaser 1, MySQL row 1 | PASS |
-| Duplicate purchase | 동일 user 20개 동시 요청: 200 1건, 400 19건, stock 1 감소, MySQL row 1 | PASS |
-| Sold out | stock 10, 50개 동시 요청: 200 10건, 410 40건, Redis stock 0, MySQL rows 10 | PASS |
-| Normal cancel | MySQL row 삭제, stock 1 증가, purchased/pending 제거 | PASS |
-| Duplicate cancel | HTTP 400, stock 추가 증가 없음 | PASS |
-| DB failure | MySQL 중지 후 3회 실패, source metadata를 포함한 DLQ 메시지 생성, source lag 0 | PASS |
-| DLQ recovery | MySQL 복구 후 DLQ replay, MySQL row 복구, DLQ lag 0 | PASS |
-| DLQ failure | 잘못된 DLQ broker로 실제 publish 실패, source 미commit, 새 consumer에서 동일 메시지 수신 | PASS |
-| DB commit → offset failure | 동일 BUY/CANCEL record 재전달 후 MySQL/Redis side effect 1회, 이후 offset 진행 | PASS |
-| BUY/CANCEL ordering | 동일 user 20개 BUY→CANCEL: 모두 200/200, 최종 MySQL 0, Redis stock 원복 | PASS |
+### 🔶 v8.0: Kafka 장애 경계 재검증과 예매 상태 전이 보강
 
-## Measured load-test result
+기존 흐름은 DB 실패 → 재시도 → DLQ 격리 → 수동 재처리까지 갖췄습니다. 하지만 “MySQL commit 뒤 offset commit 전에 워커가 종료되면?”, “DLQ 발행도 실패하면?”, “BUY와 CANCEL이 다른 파티션에 들어가면?”, “재시도와 replay가 복구 중인 시스템에 부하를 더하지는 않나?”라는 질문이 남았습니다.
 
-다음은 `50,000 TPS`가 아니라 **50,000명의 구매 흐름을 동시성 300으로 실행한 한 번의 로컬 측정 결과**입니다. 대기열 polling 때문에 실제 HTTP 요청 수는 사용자 수보다 많습니다.
+이 질문을 별도 [kafka-recovery-lab](https://github.com/whxodus0121/kafka-recovery-lab)에서 at-least-once delivery, manual commit, 중복 전달과 멱등 소비, Retry/DLQ/Replay, Backoff/Jitter, Retry Storm, 복구 속도 제어 실험으로 분리해 다뤘습니다. 이후 결과를 전부 복사하지 않고 현재 예매 도메인에 필요한 Redis 상태 전이, 사용자 단위 순서, offset/DLQ 경계와 중복 처리 방어만 v8에 적용했습니다. Lab의 retry topic·전용 recovery rate limiter·`processed_events` 테이블은 이 저장소에 없습니다.
 
-Test environment:
+#### Redis 예약과 취소의 상태 전이
 
-- CPU: Intel Core i5-10400F, 6 cores / 12 logical processors
-- Memory: 15.9 GB
-- Go: 1.26.5 windows/amd64
-- Docker Desktop client/server: 29.2.0
-- Initial stock: 1,000
-- Initial connection ramp-up: 2 seconds
+동일 사용자의 동시 요청에서 중복 확인과 재고 차감 사이에 다른 요청이 끼어들 수 있었습니다. 현재 구매 예약은 하나의 Lua 실행 안에서 `SISMEMBER → 재고 확인 → DECR → SADD`를 처리합니다. Kafka 구매 이벤트 발행 실패 시 rollback도 구매자 제거가 실제로 일어난 경우에만 재고를 복구합니다.
 
-| Metric | Value |
-|---|---:|
-| User journeys | 50,000 |
-| Concurrency | 300 |
-| HTTP attempts including polling | 51,540 |
-| HTTP responses | 51,540 |
-| Transport errors | 0 |
-| Response rate | 100.00% |
-| 2xx request ratio | 4.93% |
-| Purchase success (`200`) | 1,000 |
-| Waiting responses (`202`) | 1,540 |
-| Expected sold-out responses (`410`) | 49,000 |
-| Duration | 12.745 s |
-| Throughput | 4,044.06 req/s |
-| Latency average | 34.912 ms |
-| Latency p50 | 18.276 ms |
-| Latency p95 | 38.000 ms |
-| Latency p99 | 999.260 ms |
-| Final Redis stock / purchasers | 0 / 1,000 |
-| Final MySQL purchase rows | 1,000 |
-| Kafka source lag after drain | 0 |
+취소는 `BeginCancel → Kafka CANCEL 발행 → worker의 DB 삭제 → FinalizeCancel` 순서입니다. 발행 전에는 pending만 표시하고 재고를 돌려주지 않습니다. `FinalizeCancel`은 pending을 제거한 첫 실행에서만 구매자 제거와 재고 증가를 수행하므로 재전달에 따른 이중 복구를 피합니다. Redis 통합 테스트에서 중복 구매는 성공 1건·재고 9·구매자 1명, 재고 10장 경쟁은 성공 10건·재고 0, 취소 후 재고 1·구매자 0·pending 0을 확인했습니다.
 
-낮은 2xx 비율은 시스템 오류 때문이 아니라 초기 재고를 1,000개로 제한한 테스트 조건에 따른 결과입니다. 재고 소진 이후 49,000건은 의도된 `410 Sold Out` 응답이며 transport error는 0건이었습니다.
+![Redis 원자적 중복 구매·매진 경쟁·취소 수명주기 통합 테스트](./images/v8_redis_atomic_test.jpg)
 
-`latency_ms`는 각 HTTP 요청 직전부터 응답 또는 transport error까지의 시간입니다. 원본 요청별 결과는 `test_log.csv`, transport error는 `test_errors.csv`에 기록됩니다.
+#### 같은 사용자 이벤트의 Kafka 순서
 
-```powershell
-go run ./buy -requests 50000 -concurrency 300 -ramp-up 2s
-```
+BUY와 CANCEL의 key를 모두 `userID`로 설정하고 `kafka.Hash`로 파티션을 고릅니다. 같은 사용자 key의 이벤트는 같은 파티션에 들어가 순서대로 소비될 수 있습니다. 통합 테스트에서 동일 사용자 BUY → CANCEL이 파티션 0에 순서대로 기록됐습니다. 이는 **사용자 단위 순서**이며, 토픽 전체의 글로벌 순서나 DLQ replay와 새 source 이벤트 사이의 순서를 보장하지 않습니다.
 
-## Run
+![동일 사용자 BUY·CANCEL의 같은 파티션 순서 검증](./images/v8_user_ordering.jpg)
 
-```powershell
-docker compose up -d
-go run ./cmd/worker
-go run .
-```
+#### MySQL·DLQ와 source offset의 경계
 
-- Purchase: `GET http://127.0.0.1:8080/ticket?user_id=user-1`
-- Cancel: `GET http://127.0.0.1:8080/cancel?user_id=user-1`
-- Health: `GET http://127.0.0.1:8080/healthz`
-- Metrics: API `:8081`, worker `:8082`
+워커는 `FetchMessage → BUY/CANCEL 처리 → CommitMessages`를 사용합니다. MySQL 처리가 성공하면 source offset을 commit합니다. 재시도 후에도 DB 처리가 실패하면 **DLQ 발행이 성공한 뒤에만** source offset을 commit합니다. DB 처리와 DLQ 발행이 모두 실패하면 commit하지 않고 워커를 멈춰, 다음 소비가 실패한 파티션의 뒤쪽 offset을 먼저 진행시키지 않게 합니다.
 
-MySQL schema는 `mysql-init.sql`로 초기화됩니다. API 재시작은 `SetNX`를 사용하므로 기존 Redis 재고와 구매자 집합을 초기화하지 않습니다. Source topic은 `cmd/worker`만 소비하며 API 프로세스는 중복 consumer group을 만들지 않습니다.
+특히 DB 장애와 도달 불가능한 DLQ 주소 `127.0.0.1:19092`를 동시에 주입한 통합 테스트에서 DLQ 발행 실패를 확인했습니다. 이후 consumer를 재시작했을 때 동일 source record(`restart-user`, partition 0, offset 0)가 다시 전달됐습니다. “DB 실패면 DLQ로 간다”에서 한 단계 더 나아가 **DLQ 자체가 실패할 때 원본을 남기는 경계**를 검증한 것입니다. DLQ 발행 성공 후 source commit이 실패하면 DLQ 중복 가능성은 여전히 남습니다.
 
-## Remaining limitations
+![DB와 DLQ 발행이 모두 실패한 뒤 source record 재전달 검증](./images/v8_dlq_publish_failure.jpg)
 
-- Redis 예약 성공 직후 API가 Kafka 발행 전에 종료되면 예약이 Redis에 남을 수 있습니다. 해결하려면 outbox 또는 reconciliation이 필요하지만 v8 범위에는 추가하지 않았습니다.
-- 오래된 BUY가 DLQ에 있고 같은 사용자의 이후 CANCEL이 source에서 성공한 뒤 BUY를 replay하면 현재 상태를 되돌릴 수 있습니다. event version과 conditional apply가 필요합니다.
-- Kafka는 개발용 단일 broker, replication factor 1이므로 broker 장애 내구성을 보장하지 않습니다.
-- worker는 미commit 실패에서 안전하게 중단하지만 자동 재시작 supervisor와 alert는 포함하지 않습니다.
-- 현재 MySQL UNIQUE는 동일 사용자·티켓의 현재 구매 상태를 보호할 뿐 서로 다른 payload가 같은 event identity를 재사용하는 오류는 탐지하지 않습니다.
-- p99 999.260ms tail latency spike의 원인은 확인하지 못했습니다.
-- API 인증, request rate limit, tracing과 durable audit log는 현재 범위 밖입니다.
+#### DB commit 후 offset commit 실패와 멱등성
+
+Kafka offset commit과 외부 MySQL commit은 하나의 트랜잭션이 아닙니다. `MySQL commit 성공 → offset commit 실패/워커 종료 → 같은 record 재전달`은 제거할 수 없으므로 at-least-once 전달을 허용하고 현재 부수효과를 멱등하게 처리합니다. BUY는 UNIQUE 제약과 `OnConflict{DoNothing: true}`로 중복 INSERT를 건너뜁니다. CANCEL은 같은 행을 다시 DELETE해도 최종 행이 0이고, Redis `FinalizeCancel`도 pending이 없다면 재고를 다시 늘리지 않습니다.
+
+실제 Kafka·MySQL 통합 테스트에서 DB 반영 직후 offset commit 실패를 주입했습니다. 재전달된 BUY 로그는 `purchase saved` 다음 `duplicate purchase skipped`로 이어졌고, CANCEL도 DELETE와 Redis 재고 반환이 한 번만 남았습니다. 이는 현재 BUY/CANCEL 부수효과에 대한 검증이지 exactly-once 보장은 아닙니다.
+
+![DB 반영 후 offset commit 실패를 주입한 BUY·CANCEL 재전달 멱등성 테스트](./images/v8_redelivery_idempotency.jpg)
+
+Lab에서는 `eventId`와 `processed_events`를 같은 DB 트랜잭션에 기록하는 방식도 실험했습니다. 현재 도메인은 UNIQUE INSERT, 반복 DELETE, pending 조건부 Redis no-op으로 동일 record 재전달을 방어할 수 있어 별도 테이블의 트랜잭션·인덱스·저장 비용을 선택하지 않았습니다. 결제, 포인트, 감사 로그, 누적 UPDATE처럼 비멱등 효과가 생기면 이벤트 식별자 저장을 다시 검토해야 합니다.
+
+#### 최신 로컬 부하 재측정과 사후 확인
+
+초기 재고 1,000장에서 **50,000 user journeys를 동시성 300, 초기 ramp-up 2초**로 실행했습니다. WAITING 사용자의 재조회까지 합쳐 총 51,324번의 HTTP 요청·응답이 발생했고 전송 오류는 0건이었습니다. 한 번의 로컬 실행에서 12.607초, 4,071.14 req/s를 기록했습니다. 평균 38.504ms, p50 23.096ms, p95 52.142ms, p99 905.764ms입니다. 운영 환경의 지속 처리율로 일반화할 수 없습니다.
+
+| HTTP 상태 | 건수 | 해석 |
+|---|---:|---|
+| 200 | 1,000 | 구매 요청 성공 |
+| 202 | 1,324 | 대기열 응답·재조회, 구매 성공 아님 |
+| 410 | 49,000 | 초기 재고 1,000장 소진 뒤 의도된 Sold Out |
+
+2xx 2,324건을 구매 성공으로 세지 않았고, 410을 시스템 장애로 분류하지 않았습니다.
+
+![v8 로컬 부하 테스트 조건·응답 분포·지연시간](./images/v8_load_test_result.jpg)
+
+실행 후 Redis 재고 0, Redis 구매자 1,000명, MySQL `concert_2026` 구매 행 1,000개를 직접 확인했습니다. Kafka `ticket-group`의 세 파티션은 모두 LAG 0이었고, CURRENT-OFFSET 합계도 1,000으로 HTTP 200 구매 성공 건수와 일치했습니다. 이는 **해당 로컬 실행의 관측값**입니다.
+
+![부하 실행 후 Redis·MySQL·Kafka 상태 교차 확인](./images/v8_load_test_consistency.jpg)
+
+#### 남은 한계
+
+- Redis 예약 성공 직후 Kafka 발행 전에 API 프로세스가 죽으면 두 시스템은 원자적으로 함께 갱신되지 않습니다. 이를 메우려면 outbox나 reconciliation 같은 별도 설계가 필요합니다.
+- 오래된 BUY가 DLQ에 남은 동안 뒤의 CANCEL 등 상태가 진행되면, 나중의 replay는 최신 상태와 순서 충돌을 일으킬 수 있습니다. 현재 수동 replay가 이를 일반적으로 해결하지는 않습니다.
+- 개발용 Kafka는 single broker·replication factor 1입니다. 브로커 자체 장애에 대한 내구성을 검증한 구성이 아닙니다.
+- 멱등성 검증 범위는 현재 BUY/CANCEL 부수효과입니다. 이번 로컬 실행의 p99 905.764ms tail latency 원인도 아직 확정하지 못했습니다.
+
+## 🛠 Tech Stack
+
+- **Language:** Go
+- **Database:** MySQL 8.0, GORM, `(user_id, ticket_name)` UNIQUE 제약
+- **Cache & Queue:** Redis, Lua, Sorted Set / Active Set
+- **Message Broker:** Apache Kafka (`ticket-topic`, `ticket-dlq-topic`)
+- **Monitoring:** Prometheus, Grafana
+- **Local infrastructure:** Docker Compose
+
+## 🚦 실행 방법
+
+1. `docker compose up -d`로 MySQL·Redis·Kafka·Prometheus·Grafana를 실행합니다. `mysql-init.sql`이 초기 DB에서 `purchases`와 `tickets` 테이블 및 UNIQUE 제약을 생성합니다.
+2. 별도 터미널에서 `go run ./cmd/worker`로 source consumer 워커를 실행합니다.
+3. `go run .`으로 API(`:8080`)를 실행합니다. 재고 `ticket_stock:concert_2026`은 키가 없을 때만 1,000으로 초기화되므로 재실행만으로 테스트 상태가 초기화되지 않습니다.
+4. `GET /ticket?user_id=...`로 예매하고 `GET /cancel?user_id=...`로 취소 요청을 보냅니다. 장애 복구 실험에서는 DB 정상화 후 `/admin/recover-dlq`로 수동 재처리를 시작할 수 있습니다.
+5. 로컬 부하 클라이언트는 `go run ./buy -requests 50000 -concurrency 300 -ramp-up 2s`로 실행합니다. 재현 전에는 Redis·MySQL·Kafka의 기존 상태를 별도로 확인해야 합니다.
+
+통합 테스트는 실제 Redis·Kafka·MySQL을 사용하는 항목이 있으므로, 실행 전 해당 서비스와 테스트별 환경변수 조건을 확인해야 합니다. 캡처된 PASS는 기록된 로컬 실행의 결과이며 모든 환경에서의 재현을 뜻하지 않습니다.
